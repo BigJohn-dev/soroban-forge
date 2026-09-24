@@ -71,6 +71,25 @@ fn parties(
     (&accounts.user1, &accounts.user2, &accounts.arbiter)
 }
 
+/// Assert that a full (non-paged) read of a participant's index equals
+/// `expected`, exactly in creation order, with a complete list (no next
+/// cursor).
+fn assert_full_index(client: &SorobanForgeEscrowClient<'_>, party: &Address, expected: &[u64]) {
+    let limit = u32::try_from(expected.len()).expect("test lists fit in u32");
+    let page = client.escrows_for_participant(party, &0, &limit);
+    assert_eq!(page.total, limit, "index must hold the whole expected list");
+    assert_eq!(page.ids.len(), limit);
+    for (n, want) in expected.iter().enumerate() {
+        let i = u32::try_from(n).expect("index fits in u32");
+        assert_eq!(
+            page.ids.get_unchecked(i),
+            *want,
+            "creation-order position {i}"
+        );
+    }
+    assert_eq!(page.next_cursor, None);
+}
+
 // -----------------------------------------------------------------------
 // Creation
 // -----------------------------------------------------------------------
@@ -442,6 +461,178 @@ fn operations_on_missing_escrow_are_not_found() {
         ForgeError::NotFound
     );
     let _ = (token, buyer, seller, arbiter);
+}
+
+// -----------------------------------------------------------------------
+// Participant index views (escrows_for_participant)
+// -----------------------------------------------------------------------
+
+#[test]
+fn create_indexes_all_distinct_parties() {
+    let (_env, token, _tc, _id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let first = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    let second = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+
+    for party in [buyer, seller, arbiter] {
+        let page = client.escrows_for_participant(party, &0, &10);
+        assert_eq!(page.total, 2);
+        assert_eq!(page.ids.len(), 2);
+        assert_eq!(page.ids.get_unchecked(0), first);
+        assert_eq!(page.ids.get_unchecked(1), second);
+        assert_eq!(page.next_cursor, None);
+    }
+}
+
+#[test]
+fn repeated_role_address_is_indexed_once() {
+    let (_env, token, _tc, _id, client, accounts) = setup!();
+    let (buyer, _seller, _arbiter) = parties(&accounts);
+    // The same address wears two roles (seller and arbiter): it must be
+    // indexed once, or iteration would yield this id twice.
+    let shared = &accounts.user3;
+    let id = create(&client, &token, buyer, shared, shared, TIMEOUT);
+
+    assert_full_index(&client, buyer, &[id]);
+    let page = client.escrows_for_participant(shared, &0, &10);
+    assert_eq!(page.total, 1, "one address in two roles is indexed once");
+    assert_eq!(page.ids.get_unchecked(0), id);
+}
+
+#[test]
+fn unknown_address_returns_empty_page() {
+    let (_env, token, _tc, _id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+
+    // An address this contract has never seen yields an empty result, not
+    // an error.
+    let page = client.escrows_for_participant(&accounts.validator, &0, &10);
+    assert_eq!(page.total, 0);
+    assert_eq!(page.ids.len(), 0);
+    assert_eq!(page.next_cursor, None);
+}
+
+#[test]
+fn index_is_creation_order_with_party_subsets() {
+    let (_env, token, _tc, _id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let other_seller = &accounts.user3;
+
+    let id1 = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    let id2 = create(&client, &token, buyer, other_seller, arbiter, TIMEOUT);
+    let id3 = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    let id4 = create(&client, &token, buyer, other_seller, arbiter, TIMEOUT);
+
+    // The arbiter appears in every escrow, in creation order.
+    assert_full_index(&client, arbiter, &[id1, id2, id3, id4]);
+    // Each seller sees only the escrows it is a party to, still ordered.
+    assert_full_index(&client, seller, &[id1, id3]);
+    assert_full_index(&client, other_seller, &[id2, id4]);
+}
+
+#[test]
+fn pagination_returns_sliced_pages_with_cursors() {
+    let (env, token, _tc, _id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let mut expected = soroban_sdk::vec![&env];
+    for _ in 0..10 {
+        expected.push_back(create(&client, &token, buyer, seller, arbiter, TIMEOUT));
+    }
+
+    // A mid-list page: offset 1, limit 3 returns the 2nd..4th ids.
+    let page = client.escrows_for_participant(buyer, &1, &3);
+    assert_eq!(page.total, 10);
+    assert_eq!(page.ids.len(), 3);
+    assert_eq!(page.ids.get_unchecked(0), expected.get_unchecked(1));
+    assert_eq!(page.ids.get_unchecked(2), expected.get_unchecked(3));
+    assert_eq!(page.next_cursor, Some(4));
+
+    // A page that exactly exhausts the list: one id, then no next cursor.
+    let page = client.escrows_for_participant(buyer, &9, &1);
+    assert_eq!(page.ids.len(), 1);
+    assert_eq!(page.ids.get_unchecked(0), expected.get_unchecked(9));
+    assert_eq!(page.next_cursor, None);
+
+    // An over-run past the end is empty and terminal, not an error.
+    let page = client.escrows_for_participant(buyer, &12, &5);
+    assert_eq!(page.total, 10);
+    assert_eq!(page.ids.len(), 0);
+    assert_eq!(page.next_cursor, None);
+}
+
+#[test]
+fn pagination_iterates_every_created_id_exactly_once() {
+    let (env, token, _tc, _id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let mut expected = soroban_sdk::vec![&env];
+    // Well past 25 so paging crosses several page boundaries; also keeps
+    // this test inside CI's budget (each create is a single small write).
+    for _ in 0..26 {
+        expected.push_back(create(&client, &token, buyer, seller, arbiter, TIMEOUT));
+    }
+
+    let mut seen = soroban_sdk::vec![&env];
+    let mut cursor = 0u32;
+    let limit = 7u32;
+    loop {
+        let page = client.escrows_for_participant(buyer, &cursor, &limit);
+        assert_eq!(page.total, 26, "total is reported on every page");
+        assert!(
+            page.ids.len() <= limit,
+            "a page may not exceed its requested limit"
+        );
+        for n in 0..page.ids.len() {
+            seen.push_back(page.ids.get_unchecked(n));
+        }
+        match page.next_cursor {
+            Some(next) => {
+                assert!(next > cursor, "pagination must advance past the page");
+                cursor = next;
+            }
+            None => break,
+        }
+    }
+
+    assert_eq!(
+        seen, expected,
+        "full iteration must yield every created id exactly once, in creation order"
+    );
+    assert_eq!(seen.len(), 26);
+}
+
+#[test]
+fn zero_limit_returns_empty_page_without_residual_cursor() {
+    let (_env, token, _tc, _id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+
+    // A zero limit must not report a next cursor pointing at itself, or a
+    // naive client would loop forever.
+    let page = client.escrows_for_participant(buyer, &0, &0);
+    assert_eq!(page.total, 1);
+    assert_eq!(page.ids.len(), 0);
+    assert_eq!(page.next_cursor, None);
+}
+
+#[test]
+fn escrows_for_participant_is_read_only() {
+    let (_env, token, _tc, _id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    let second = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+
+    // Repeating the view must not change its answer: no state is touched
+    // between two identical reads.
+    let before = client.escrows_for_participant(buyer, &0, &10);
+    let after = client.escrows_for_participant(buyer, &0, &10);
+    assert_eq!(before, after);
+    assert_eq!(after.ids.len(), 2);
+
+    // And the id counter must not have advanced: the next escrow takes the
+    // id right after the last created one, proving the view wrote nothing.
+    let third = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    assert_eq!(third, second + 1);
 }
 
 // -----------------------------------------------------------------------
