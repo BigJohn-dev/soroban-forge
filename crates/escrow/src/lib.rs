@@ -58,10 +58,15 @@
 //! ## Storage and TTL
 //!
 //! Each escrow is its own **persistent** entry (`DataKey::Escrow(id)`)
-//! so the byte budget scales per record. The only instance entry is the
-//! id counter. Every write bumps the entry's TTL with the standard
-//! threshold/extend-to pattern, and `touch_ttl` is a permissionless
-//! keeper entrypoint for escrows that sit idle near expiry.
+//! so the byte budget scales per record. Every participant's creation-order
+//! index is likewise a **persistent** per-party entry
+//! (`DataKey::ParticipantIndex(Address)`), written once per escrow creation:
+//! a party's id list grows with their escrow count, so it cannot live in
+//! instance storage (one party's growth would tax every shared instance
+//! read). The only instance entry is the id counter. Every write bumps the
+//! entry's TTL with the standard threshold/extend-to pattern, and
+//! `touch_ttl` is a permissionless keeper entrypoint for escrows that sit
+//! idle near expiry.
 
 // WASM target guard: SDK 27 contracts must be built for wasm32v1-none.
 // wasm32-unknown-unknown (os=unknown) can emit features the Soroban
@@ -72,7 +77,7 @@ compile_error!(
 );
 
 use soroban_sdk::{
-    contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Env,
+    contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Env, Vec,
 };
 
 use soroban_forge_shared_utils::ForgeError;
@@ -203,6 +208,33 @@ pub trait SorobanForgeEscrow {
     /// * [`ForgeError::NotFound`] — no escrow with this id.
     fn get_escrow(env: Env, escrow_id: u64) -> Result<EscrowData, ForgeError>;
 
+    /// List the escrow ids a participant is party to (buyer, seller, or
+    /// arbiter), in creation order.
+    ///
+    /// Read-only: requires no authorization and never mutates storage. An
+    /// address with no escrows — or an address this contract has never seen
+    /// — returns an empty page, not an error. Good for building "my
+    /// escrows" views without an off-chain indexer.
+    ///
+    /// Pagination is a simple offset/limit scheme. `cursor` is the offset
+    /// of the first id to return and `limit` caps the page size. The
+    /// returned [`ParticipantEscrowsPage::next_cursor`] continues the next
+    /// page; `None` means the list is exhausted. A `limit` of `0` returns
+    /// an empty page with no next cursor.
+    ///
+    /// Iterating by replaying `next_cursor` until it is `None` yields every
+    /// escrow involving the participant exactly once, in creation order.
+    ///
+    /// # Errors
+    ///
+    /// This view never errors; unknown participants yield an empty page.
+    fn escrows_for_participant(
+        env: Env,
+        participant: Address,
+        cursor: u32,
+        limit: u32,
+    ) -> ParticipantEscrowsPage;
+
     /// Permissionless TTL keeper: bumps the escrow entry's TTL to the
     /// [`ttl::BUMP_AMOUNT`] horizon when it falls inside
     /// [`ttl::BUMP_THRESHOLD`]. Call periodically for escrows that must
@@ -258,6 +290,22 @@ pub struct EscrowData {
     pub created_at: u64,
 }
 
+/// A page of escrow ids involving a participant.
+///
+/// Returned by [`SorobanForgeEscrow::escrows_for_participant`]; powered by
+/// the per-party persistent index written at creation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParticipantEscrowsPage {
+    /// Escrow ids on this page, in creation order.
+    pub ids: Vec<u64>,
+    /// Total escrows involving the participant across all pages.
+    pub total: u32,
+    /// Offset for the next page, or `None` when `ids` ends the participant's
+    /// list. Replay it until `None` to iterate the whole list.
+    pub next_cursor: Option<u32>,
+}
+
 /// Storage keys. Escrow records are per-id **persistent** entries so the
 /// byte budget scales per record; only the id counter lives in instance
 /// storage (one small entry, written once per creation).
@@ -267,6 +315,29 @@ enum DataKey {
     Escrow(u64),
     /// Monotonic id counter.
     Count,
+    /// Creation-order ids of every escrow the `Address` participates in
+    /// (as buyer, seller, or arbiter), written once per escrow creation.
+    ///
+    /// Persistent, not instance: the entry grows with that party's escrow
+    /// count and is written only on the create path, so parking it in
+    /// instance storage would bloat a shared hot entry with one party's
+    /// growth (the same per-record-scaling argument that puts `Escrow(id)`
+    /// in persistent storage rather than a single instance map). It also
+    /// carries its own extensible TTL under the standard `bump_entry`
+    /// threshold/extend pattern, mirroring every other persistent write.
+    ///
+    /// The value is a single `Vec<u64>` appended in creation order rather
+    /// than sharded per-party keys (`ParticipantIndex(Address, u64)`).
+    /// Tradeoff: one entry per party keeps reads cheap — a page is one
+    /// entry read plus an in-memory slice — and appends are one read + one
+    /// rewrite of that party's (id-sized, 8 bytes each) list. The cost is
+    /// that a party's entry grows unboundedly and each append rewrites the
+    /// whole list; for the overwhelming majority of parties the list stays
+    /// tiny, and a party accumulating so many escrows that a single entry
+    /// fills (Soroban's ~64 KB entry cap is tens of thousands of ids)
+    /// would migrate to a sharded scheme — a compatible upgrade since the
+    /// view only ever reads through this key class.
+    ParticipantIndex(Address),
 }
 
 /// The deployable escrow contract.
@@ -308,6 +379,17 @@ impl Escrow {
         buyer.require_auth();
 
         let id = Self::next_id(&env)?;
+        // Distinct parties only: one address in several roles (e.g. seller
+        // == arbiter) is indexed once so iteration yields this id exactly
+        // once, per the index's read contract.
+        let mut participants = Vec::new(&env);
+        participants.push_back(buyer.clone());
+        if seller != buyer {
+            participants.push_back(seller.clone());
+        }
+        if arbiter != buyer && arbiter != seller {
+            participants.push_back(arbiter.clone());
+        }
         let escrow = EscrowData {
             escrow_id: id,
             buyer,
@@ -323,6 +405,10 @@ impl Escrow {
             .persistent()
             .set(&DataKey::Escrow(id), &escrow);
         bump_entry(&env, &DataKey::Escrow(id));
+        // Index write joins the rest of the success-path writes: it runs
+        // after every fallible step (validation, `require_auth`, id
+        // allocation), so it cannot observe or create partial state.
+        Self::index_participants(&env, id, &participants);
         events::escrow_created(&env, &escrow);
         Ok(id)
     }
@@ -497,6 +583,42 @@ impl Escrow {
         Self::load_escrow(&env, escrow_id)
     }
 
+    /// Read the creation-order escrow ids one page at a time for a
+    /// participant. Read-only: never mutates storage and never errors — an
+    /// unknown address or one with no escrows simply yields an empty page.
+    pub fn escrows_for_participant(
+        env: Env,
+        participant: Address,
+        cursor: u32,
+        limit: u32,
+    ) -> ParticipantEscrowsPage {
+        let ids = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ParticipantIndex(participant))
+            .unwrap_or_else(|| Vec::new(&env));
+        let total = ids.len();
+        // `cursor` may exceed `total`; clamp so an over-run returns an
+        // empty page rather than panicking on a missing index.
+        let (mut at, end) = match limit {
+            // A zero limit must not report a next cursor that points at
+            // itself forever; treat it as "list not requested".
+            0 => (total, total),
+            _ => (cursor.min(total), cursor.saturating_add(limit).min(total)),
+        };
+        let mut page = Vec::new(&env);
+        while at < end {
+            page.push_back(ids.get_unchecked(at));
+            at += 1;
+        }
+        let next_cursor = if end < total { Some(end) } else { None };
+        ParticipantEscrowsPage {
+            ids: page,
+            total,
+            next_cursor,
+        }
+    }
+
     /// Permissionless keeper: bump the escrow entry's TTL without changing
     /// any state. The existence check is deliberate — touching a missing
     /// id must fail loudly so a keeper can distinguish "extended" from
@@ -527,6 +649,23 @@ impl Escrow {
         let id = count.checked_add(1).ok_or(ForgeError::ArithmeticOverflow)?;
         env.storage().instance().set(&DataKey::Count, &id);
         Ok(id)
+    }
+
+    /// Append `id` to the creation-order index of every distinct
+    /// participant. Runs only on the create success path; each write bumps
+    /// the entry TTL like any other persistent write.
+    fn index_participants(env: &Env, id: u64, participants: &Vec<Address>) {
+        for participant in participants.iter() {
+            let key = DataKey::ParticipantIndex(participant.clone());
+            let mut ids = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(env));
+            ids.push_back(id);
+            env.storage().persistent().set(&key, &ids);
+            bump_entry(env, &key);
+        }
     }
 }
 
