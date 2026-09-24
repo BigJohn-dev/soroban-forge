@@ -13,12 +13,20 @@
 //! propose (voting_ends = now + duration)
 //!   --> Active --vote × n--> voting ends
 //!   --> execute: for > against ? Succeeded : Defeated
+//!   --> cancel (proposer only): Cancelled (terminal)
 //! ```
+//!
+//! `Cancelled` is terminal: a withdrawn proposal can never be voted on,
+//! executed, or re-opened. Cancellation is permitted at any point before
+//! execution — even after voting ends and quorum is met — so a proposer can
+//! stop a proposal that is clearly failing or was created in error.
 //!
 //! Authorization model:
 //! - `propose` requires the proposer.
 //! - `vote` requires the voter and is one-vote-per-voter per proposal.
 //! - `execute` may be called by anyone, but only once voting has ended.
+//! - `cancel_proposal` requires the original proposer and freezes a
+//!   not-yet-executed proposal.
 //! - `get_proposal` is a read-only view.
 //!
 //! The `Queued` state is reserved for an optional timelock that lands in a
@@ -58,6 +66,16 @@ pub trait SorobanForgeDaoGovernance {
     /// Finalise a proposal once voting has ended.
     fn execute(env: Env, proposal_id: u64) -> Result<(), soroban_forge_shared_utils::ForgeError>;
 
+    /// Withdraw a proposal that has not yet been executed.
+    ///
+    /// Only the original proposer may cancel. Once cancelled the proposal is
+    /// frozen against further votes and cannot be executed.
+    fn cancel_proposal(
+        env: Env,
+        proposal_id: u64,
+        proposer: Address,
+    ) -> Result<(), soroban_forge_shared_utils::ForgeError>;
+
     /// Read a stored proposal by id (read-only view).
     fn get_proposal(
         env: Env,
@@ -77,6 +95,8 @@ pub enum ProposalState {
     Defeated,
     /// Queued for delayed execution (optional timelock).
     Queued,
+    /// Withdrawn by the proposer before execution; terminal and immutable.
+    Cancelled,
 }
 
 /// A single governance proposal.
@@ -211,6 +231,37 @@ impl DaoGovernance {
         } else {
             ProposalState::Defeated
         };
+        env.storage()
+            .instance()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        Ok(())
+    }
+
+    /// Withdraw an active proposal before it is executed.
+    ///
+    /// Requires the original proposer. A proposal may be cancelled even after
+    /// voting ends and quorum is met, as long as it has not been executed (or
+    /// already cancelled). A cancelled proposal is terminal: further votes and
+    /// execution are rejected.
+    ///
+    /// * [`ForgeError::NotFound`] — no proposal with this id.
+    /// * [`ForgeError::Unauthorized`] — `proposer` is not the original proposer.
+    /// * [`ForgeError::InvalidInput`] — the proposal is no longer `Active`.
+    pub fn cancel_proposal(
+        env: Env,
+        proposal_id: u64,
+        proposer: Address,
+    ) -> Result<(), ForgeError> {
+        let mut proposal = Self::get_proposal_impl(&env, proposal_id)?;
+        if proposal.state != ProposalState::Active {
+            return Err(ForgeError::InvalidInput);
+        }
+        if proposer != proposal.proposer {
+            return Err(ForgeError::Unauthorized);
+        }
+        proposer.require_auth();
+
+        proposal.state = ProposalState::Cancelled;
         env.storage()
             .instance()
             .set(&DataKey::Proposal(proposal_id), &proposal);
@@ -424,5 +475,102 @@ mod tests {
         let (_env, client, _accounts, _id) = setup!();
         let err = client.try_get_proposal(&999).unwrap_err().unwrap();
         assert_eq!(err, ForgeError::NotFound);
+    }
+
+    #[test]
+    fn cancel_active_proposal_succeeds() {
+        let (_env, client, accounts, proposal_id) = setup!();
+        client.cancel_proposal(&proposal_id, &accounts.user1);
+        assert_eq!(
+            client.get_proposal(&proposal_id).state,
+            ProposalState::Cancelled
+        );
+    }
+
+    #[test]
+    fn cancel_immediately_after_propose_succeeds() {
+        let (env, client, accounts, _id) = setup!();
+        let fresh_id = client.propose(&accounts.user3, &payload(&env), &DURATION);
+        client.cancel_proposal(&fresh_id, &accounts.user3);
+        assert_eq!(
+            client.get_proposal(&fresh_id).state,
+            ProposalState::Cancelled
+        );
+    }
+
+    #[test]
+    fn cancel_after_quorum_before_execute_succeeds() {
+        let (env, client, accounts, proposal_id) = setup!();
+        client.vote(&proposal_id, &accounts.user2, &true);
+        client.vote(&proposal_id, &accounts.user3, &true);
+        env.ledger().set_timestamp(START + DURATION + 1);
+        client.cancel_proposal(&proposal_id, &accounts.user1);
+        assert_eq!(
+            client.get_proposal(&proposal_id).state,
+            ProposalState::Cancelled
+        );
+        assert_eq!(client.get_proposal(&proposal_id).for_votes, 2);
+    }
+
+    #[test]
+    fn cancel_by_non_proposer_is_unauthorized() {
+        let (_env, client, accounts, proposal_id) = setup!();
+        let err = client
+            .try_cancel_proposal(&proposal_id, &accounts.user2)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::Unauthorized);
+    }
+
+    #[test]
+    fn cancel_missing_proposal_is_not_found() {
+        let (_env, client, accounts, _id) = setup!();
+        let err = client
+            .try_cancel_proposal(&999, &accounts.user1)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::NotFound);
+    }
+
+    #[test]
+    fn double_cancel_is_invalid() {
+        let (_env, client, accounts, proposal_id) = setup!();
+        client.cancel_proposal(&proposal_id, &accounts.user1);
+        let err = client
+            .try_cancel_proposal(&proposal_id, &accounts.user1)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+    }
+
+    #[test]
+    fn cancel_then_vote_is_invalid() {
+        let (_env, client, accounts, proposal_id) = setup!();
+        client.cancel_proposal(&proposal_id, &accounts.user1);
+        let err = client
+            .try_vote(&proposal_id, &accounts.user2, &true)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+    }
+
+    #[test]
+    fn cancel_then_execute_is_invalid() {
+        let (_env, client, accounts, proposal_id) = setup!();
+        client.cancel_proposal(&proposal_id, &accounts.user1);
+        let err = client.try_execute(&proposal_id).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+    }
+
+    #[test]
+    fn cancel_after_execute_is_invalid() {
+        let (env, client, accounts, proposal_id) = setup!();
+        env.ledger().set_timestamp(START + DURATION + 1);
+        client.execute(&proposal_id);
+        let err = client
+            .try_cancel_proposal(&proposal_id, &accounts.user1)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
     }
 }
