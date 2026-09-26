@@ -1447,6 +1447,18 @@ mod events {
     }
 }
 
+// Negative authorization coverage for the state-changing entrypoints
+// (`initialize`, `submit`, `confirm`, `execute`), following the escrow and
+// dao-governance suites' two-layer pattern (issue #61).
+#[cfg(test)]
+mod authz;
+
+// Randomized property suite covering the threshold-enforcement,
+// execute-once, and distinct-owner confirmation-counting invariants
+// (issue #61).
+#[cfg(test)]
+mod props;
+
 #[cfg(test)]
 mod tests {
     use super::*;
