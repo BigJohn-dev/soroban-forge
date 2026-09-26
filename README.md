@@ -65,7 +65,7 @@ well-documented foundation, audit it for your use case, and ship.
 | Contract | Description | Status |
 |----------|-------------|--------|
 | **Escrow** | Three-party escrow holding real SEP-41 tokens: `create → deposit → release / refund / dispute → resolve / cancel`, arbiter-enforced dispute flow, lifecycle events, per-record persistent storage with TTL keeping | ✅ **Flagship** · 27 tests · conservation property verified |
-| **Vesting** | Time-locked token release with cliff and linear release (`create_schedule → claim / claimable`) — `claim` settles through a real SEP-41 transfer | ✅ Settlement · 27 tests |
+| **Vesting** | Time-locked token release: cliff + linear ramp (`create_schedule`) or an explicit unlock table (`create_tranche_schedule`), both settled by `claim` through a real SEP-41 transfer | ✅ Settlement · 51 tests |
 | **Multi-Sig Wallet** | Multi-owner wallet with configurable approval thresholds (`initialize → submit → confirm → execute`) — no dispatch yet | ✅ State machine · 18 tests |
 | **DAO Governance** | On-chain proposals, one-vote-per-voter voting, deadline enforcement, and finalisation — executes nothing on-chain | ✅ State machine · 16 tests |
 | **Subscription Payments** | Recurring payment plans with periodic billing (`subscribe → charge / cancel`) — charges nothing | ✅ State machine · 12 tests |

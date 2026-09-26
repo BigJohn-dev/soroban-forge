@@ -30,14 +30,22 @@ are honestly labeled where they track but do not settle.
 
 ## Vesting (`crates/vesting`)
 
+Two schedule shapes share one id space and one claim path: **linear**
+(cliff + ramp, unchanged) and **tranche** (explicit unlock table).
+
 | Entrypoint | Status | Notes |
 |---|---|---|
-| `create_schedule` | ✅ Implemented | Validates `total_amount > 0`, `duration > 0`, `cliff <= duration` |
-| `claim` | ✅ Implemented | **Real token transfer** contract → beneficiary before the state write (transfer-before-state); zero-claim calls skip the transfer; a failed transfer surfaces as `ForgeError::TokenTransferFailed` with `claimed`/`status` unchanged |
-| `claimable` | ✅ Implemented | Read-only |
-| `get_status` | ✅ Implemented | Read-only |
+| `create_schedule` | ✅ Implemented | Linear shape; validates `total_amount > 0`, `duration > 0`, `cliff <= duration` |
+| `create_tranche_schedule` | ✅ Implemented | Tranche shape; validates non-empty table, ≤ `MAX_TRANCHES` (32) entries, `amount > 0`, strictly increasing `unlock_at`, sum within `i128::MAX`; beneficiary-authorized, table stored once and immutable |
+| `claim` | ✅ Implemented | Both kinds; **real token transfer** contract → beneficiary before the state write (transfer-before-state); zero-claim calls skip the transfer; a failed transfer surfaces as `ForgeError::TokenTransferFailed` with `claimed`/`status` unchanged |
+| `claimable` | ✅ Implemented | Read-only; kind-aware (ramp vs cumulative unlock step function) |
+| `get_status` | ✅ Implemented | Read-only; derived from ledger time + claimed amount, both kinds |
+| `get_tranche_schedule` | ✅ Implemented | Read-only record view, immutable unlock table included (`NotFound` for a linear id; the linear `get_schedule` view is tracked separately) |
 | Revocation | ❌ Not implemented | `Revoked` status reserved |
+| Enumerable schedules per beneficiary | ❌ Not implemented | Follow-up |
 | `VestingSchedule.token` field | ✅ Wired | Read by `claim` for the SEP-41 payout |
+| Tests | ✅ 51 | 27 linear (unchanged) + 24 tranche: table validation, boundary claims at/around every unlock, real-SAC settlement, interleaved claims at arbitrary timestamps, `u64::MAX` offset boundary, transfer-failure and undeployed-token paths, both kinds on one id space |
+
 
 ## Multi-Sig Wallet (`crates/multi-sig-wallet`)
 

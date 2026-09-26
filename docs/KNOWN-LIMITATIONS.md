@@ -52,7 +52,11 @@ its own tranche using the escrow pattern (see
 
 The other five contracts keep all state in `env.storage().instance()`.
 Long-lived records there still face the byte budget and TTL-expiry
-bricking problem. Migrate per contract with the escrow pattern.
+bricking problem. Migrate per contract with the escrow pattern. Vesting
+is where the byte budget bites first: a tranche schedule's immutable
+unlock table lives in the same instance entry as every other schedule
+(capped at `MAX_TRANCHES` = 32 entries per schedule, which bounds the
+per-record cost but not the number of records).
 
 ### 3. No events outside escrow
 
