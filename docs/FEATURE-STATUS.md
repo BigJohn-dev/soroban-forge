@@ -46,7 +46,6 @@ Two schedule shapes share one id space and one claim path: **linear**
 | `VestingSchedule.token` field | ✅ Wired | Read by `claim` for the SEP-41 payout |
 | Tests | ✅ 51 | 27 linear (unchanged) + 24 tranche: table validation, boundary claims at/around every unlock, real-SAC settlement, interleaved claims at arbitrary timestamps, `u64::MAX` offset boundary, transfer-failure and undeployed-token paths, both kinds on one id space |
 
-
 ## Multi-Sig Wallet (`crates/multi-sig-wallet`)
 
 | Entrypoint | Status | Notes |
