@@ -237,6 +237,13 @@ pub trait SorobanForgeDaoGovernance {
         proposal_id: u64,
         voter: Address,
     ) -> Result<bool, soroban_forge_shared_utils::ForgeError>;
+
+    /// Permissionless keeper entrypoint: extend the persistent storage TTL of a proposal.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — no proposal with this id.
+    fn touch_ttl(env: Env, proposal_id: u64) -> Result<(), soroban_forge_shared_utils::ForgeError>;
 }
 
 /// Lifecycle state of a governance proposal.
@@ -320,10 +327,32 @@ pub struct Proposal {
     pub bond_state: BondState,
 }
 
-/// Instance-storage keys.
+/// Persistent storage TTL constants.
+///
+/// One ledger closes roughly every 5 seconds, so 17,280 ledgers ≈ 1 day.
+/// `BUMP_AMOUNT` is the lifetime written on every touch; `BUMP_THRESHOLD`
+/// is how close to expiry an entry must be before a bump applies. The
+/// 30-day horizon comfortably covers a proposal between keeper touches.
+mod ttl {
+    pub const DAY_IN_LEDGERS: u32 = 17_280;
+    /// Lifetime applied on every TTL touch.
+    pub const BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
+    /// Bump only when the entry is within this window of expiring.
+    pub const BUMP_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
+}
+
+/// Bump a persistent entry's TTL to the [`ttl::BUMP_AMOUNT`] horizon when
+/// it falls inside [`ttl::BUMP_THRESHOLD`].
+fn bump_entry(env: &Env, key: &DataKey) {
+    env.storage()
+        .persistent()
+        .extend_ttl(key, ttl::BUMP_THRESHOLD, ttl::BUMP_AMOUNT);
+}
+
+/// Instance and persistent storage keys.
 #[contracttype]
 enum DataKey {
-    /// The proposal record for `u64` id.
+    /// The proposal record for `u64` id (persistent storage).
     Proposal(u64),
     /// Marks that `voter` has already voted on `proposal_id`.
     Vote(u64, Address),
@@ -441,10 +470,10 @@ impl DaoGovernance {
             bond_amount: bond.amount,
             bond_state: BondState::Posted,
         };
+        let key = DataKey::Proposal(proposal_id);
         env.storage().instance().set(&DataKey::Count, &proposal_id);
-        env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+        env.storage().persistent().set(&key, &proposal);
+        bump_entry(&env, &key);
         env.storage().instance().set(&DataKey::BondHeld, &next_held);
         events::proposed(&env, &proposal);
         events::bond_posted(&env, proposal_id, &bond.token, bond.amount);
@@ -486,10 +515,10 @@ impl DaoGovernance {
                 .checked_add(1)
                 .ok_or(ForgeError::ArithmeticOverflow)?;
         }
+        let key = DataKey::Proposal(proposal_id);
         env.storage().instance().set(&vote_key, &true);
-        env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+        env.storage().persistent().set(&key, &proposal);
+        bump_entry(&env, &key);
         events::vote_cast(&env, proposal_id, &voter, support);
         Ok(())
     }
@@ -524,11 +553,11 @@ impl DaoGovernance {
 
         match proposal.state {
             ProposalState::Active => {
+                let key = DataKey::Proposal(proposal_id);
                 if proposal.for_votes > proposal.against_votes {
                     proposal.state = ProposalState::Succeeded;
-                    env.storage()
-                        .instance()
-                        .set(&DataKey::Proposal(proposal_id), &proposal);
+                    env.storage().persistent().set(&key, &proposal);
+                    bump_entry(&env, &key);
                     events::finalised(
                         &env,
                         proposal_id,
@@ -554,9 +583,8 @@ impl DaoGovernance {
 
                     proposal.state = ProposalState::Defeated;
                     proposal.bond_state = BondState::Forfeited;
-                    env.storage()
-                        .instance()
-                        .set(&DataKey::Proposal(proposal_id), &proposal);
+                    env.storage().persistent().set(&key, &proposal);
+                    bump_entry(&env, &key);
                     env.storage().instance().set(&DataKey::BondHeld, &next_held);
                     events::finalised(
                         &env,
@@ -607,9 +635,9 @@ impl DaoGovernance {
 
                 proposal.state = ProposalState::Executed;
                 proposal.bond_state = BondState::Refunded;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Proposal(proposal_id), &proposal);
+                let key = DataKey::Proposal(proposal_id);
+                env.storage().persistent().set(&key, &proposal);
+                bump_entry(&env, &key);
                 env.storage().instance().set(&DataKey::BondHeld, &next_held);
                 events::finalised(
                     &env,
@@ -673,9 +701,9 @@ impl DaoGovernance {
 
         proposal.state = ProposalState::Cancelled;
         proposal.bond_state = BondState::Refunded;
-        env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+        let key = DataKey::Proposal(proposal_id);
+        env.storage().persistent().set(&key, &proposal);
+        bump_entry(&env, &key);
         env.storage().instance().set(&DataKey::BondHeld, &next_held);
         events::bond_released(
             &env,
@@ -766,9 +794,21 @@ impl DaoGovernance {
 
     fn get_proposal_impl(env: &Env, proposal_id: u64) -> Result<Proposal, ForgeError> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Proposal(proposal_id))
             .ok_or(ForgeError::NotFound)
+    }
+
+    /// Permissionless keeper: bump the proposal entry's TTL without changing
+    /// any state. The existence check is deliberate — touching a missing
+    /// id must fail loudly with `ForgeError::NotFound`.
+    pub fn touch_ttl(env: Env, proposal_id: u64) -> Result<(), ForgeError> {
+        let key = DataKey::Proposal(proposal_id);
+        if !env.storage().persistent().has(&key) {
+            return Err(ForgeError::NotFound);
+        }
+        bump_entry(&env, &key);
+        Ok(())
     }
 }
 
@@ -1061,12 +1101,12 @@ mod tests {
         env.as_contract(contract_id, || {
             let mut proposal: Proposal = env
                 .storage()
-                .instance()
+                .persistent()
                 .get(&DataKey::Proposal(proposal_id))
                 .expect("proposal exists");
             proposal.bond_amount = amount;
             env.storage()
-                .instance()
+                .persistent()
                 .set(&DataKey::Proposal(proposal_id), &proposal);
         });
     }
@@ -2196,6 +2236,23 @@ mod tests {
             &accounts.user1,
             false,
         );
+    }
+
+    #[test]
+    fn touch_ttl_extends_and_keeps_state_intact() {
+        let (env, _token, _tc, _contract_id, client, accounts, target_id) = fresh_bond!();
+        let proposal_id = client.propose(&accounts.user1, &target_id, &payload(&env), &DURATION);
+        assert_eq!(client.touch_ttl(&proposal_id), ());
+        let proposal = client.get_proposal(&proposal_id);
+        assert_eq!(proposal.proposal_id, proposal_id);
+        assert_eq!(proposal.state, ProposalState::Active);
+    }
+
+    #[test]
+    fn touch_ttl_unknown_proposal_returns_not_found() {
+        let (_env, _token, _tc, _contract_id, client, _accounts, _target_id) = fresh_bond!();
+        let err = client.try_touch_ttl(&999).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::NotFound);
     }
 }
 

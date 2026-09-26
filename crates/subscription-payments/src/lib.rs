@@ -38,7 +38,9 @@
 extern crate std;
 
 use soroban_forge_shared_utils::ForgeError;
-use soroban_sdk::{contract, contractclient, contractimpl, contracttype, token, Address, Env, Vec};
+use soroban_sdk::{
+    contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Env, Vec,
+};
 
 /// Maximum consecutive failed payment attempts before transitioning to Cancelled.
 const MAX_RETRIES: u32 = 3;
@@ -252,6 +254,7 @@ impl SubscriptionPayments {
             &DataKey::ProviderSubscriptions(provider),
             subscription_id,
         );
+        events::subscribed(&env, &subscription);
         Ok(subscription_id)
     }
 
@@ -299,6 +302,7 @@ impl SubscriptionPayments {
                 env.storage()
                     .instance()
                     .set(&DataKey::Subscription(subscription_id), &subscription);
+                events::charged(&env, &subscription);
                 Ok(subscription.amount)
             }
             _ => {
@@ -438,6 +442,7 @@ impl SubscriptionPayments {
         env.storage()
             .instance()
             .set(&DataKey::Subscription(subscription_id), &subscription);
+        events::cancelled(&env, &subscription);
         Ok(())
     }
 
@@ -560,6 +565,71 @@ impl SubscriptionPayments {
     }
 }
 
+/// Lifecycle events emitted by the subscription payments contract.
+mod events {
+    use super::*;
+
+    #[contractevent]
+    pub struct Subscribed {
+        #[topic]
+        pub subscription_id: u64,
+        pub subscriber: Address,
+        pub provider: Address,
+        pub token: Address,
+        pub amount: i128,
+        pub period: u64,
+    }
+
+    #[contractevent]
+    pub struct Charged {
+        #[topic]
+        pub subscription_id: u64,
+        pub amount: i128,
+        pub last_charged: u64,
+        pub next_charge_at: u64,
+    }
+
+    #[contractevent]
+    pub struct Cancelled {
+        #[topic]
+        pub subscription_id: u64,
+        pub subscriber: Address,
+    }
+
+    pub fn subscribed(env: &Env, subscription: &Subscription) {
+        Subscribed {
+            subscription_id: subscription.subscription_id,
+            subscriber: subscription.subscriber.clone(),
+            provider: subscription.provider.clone(),
+            token: subscription.token.clone(),
+            amount: subscription.amount,
+            period: subscription.period,
+        }
+        .publish(env);
+    }
+
+    pub fn charged(env: &Env, subscription: &Subscription) {
+        let next_charge_at = subscription
+            .last_charged
+            .saturating_add(subscription.period);
+        Charged {
+            subscription_id: subscription.subscription_id,
+            amount: subscription.amount,
+            last_charged: subscription.last_charged,
+            next_charge_at,
+        }
+        .publish(env);
+    }
+
+    pub fn cancelled(env: &Env, subscription: &Subscription) {
+        Cancelled {
+            subscription_id: subscription.subscription_id,
+            subscriber: subscription.subscriber.clone(),
+        }
+        .publish(env);
+    }
+}
+
 #[cfg(test)]
 mod authz;
 #[cfg(test)]
@@ -569,7 +639,7 @@ mod props;
 mod tests {
     use super::*;
     use soroban_forge_test_utils::TestAccounts;
-    use soroban_sdk::testutils::{Address as _, Ledger as _};
+    use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
     use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
     use soroban_sdk::{Address, Env};
 
@@ -1268,5 +1338,16 @@ mod tests {
         // Cannot cancel already cancelled subscription
         let err = client.try_cancel(&subscription_id).unwrap_err().unwrap();
         assert_eq!(err, ForgeError::InvalidInput);
+    }
+
+    #[test]
+    fn events_emitted_on_lifecycle_actions() {
+        let (env, _token, _tc, _contract_id, client, _accounts, subscription_id) = setup!();
+        env.ledger().set_timestamp(START + PERIOD);
+        client.charge(&subscription_id);
+        client.cancel(&subscription_id);
+
+        let events = env.events().all();
+        assert!(!events.events().is_empty());
     }
 }

@@ -73,3 +73,12 @@ of `0` fails with `ForgeError::InvalidInput`.
 the last charge. `charge_catchup` returns the total billed amount and advances
 `last_charged` once per successfully settled period. Period and total arithmetic
 uses checked operations.
+
+## Events
+
+The contract emits typed on-chain lifecycle events for indexers and off-chain monitoring:
+
+- `Subscribed` (topic: `subscription_id: u64`) — emitted when a subscription is created via `subscribe`. Contains `subscriber`, `provider`, `token`, `amount`, and `period`.
+- `Charged` (topic: `subscription_id: u64`) — emitted on successful billing via `charge` or `charge_catchup`. Contains `amount`, `last_charged`, and `next_charge_at`.
+- `Cancelled` (topic: `subscription_id: u64`) — emitted when a subscription is cancelled via `cancel`. Contains `subscriber`.
+

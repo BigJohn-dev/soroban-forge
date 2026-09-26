@@ -62,7 +62,9 @@
 extern crate std;
 
 use soroban_forge_shared_utils::ForgeError;
-use soroban_sdk::{contract, contractclient, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{
+    contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Env,
+};
 
 /// Maximum number of sales one `settle_sales` invocation may settle,
 /// checked **before any transfer** and reported as
@@ -150,6 +152,16 @@ pub trait SorobanForgeMarketplaceRoyalties {
         env: Env,
         collection: Address,
     ) -> Result<SettlementSummary, soroban_forge_shared_utils::ForgeError>;
+
+    /// Permissionless keeper entrypoint: extend the persistent storage TTL of a collection's royalty configuration and settlement summary.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — no royalty configuration for this collection.
+    fn touch_ttl(
+        env: Env,
+        collection: Address,
+    ) -> Result<(), soroban_forge_shared_utils::ForgeError>;
 }
 
 /// Lifecycle state of a registered royalty configuration.
@@ -200,12 +212,35 @@ pub struct SettlementSummary {
     pub royalties_paid: i128,
 }
 
-/// Instance-storage keys.
+/// Persistent storage TTL constants.
+///
+/// One ledger closes roughly every 5 seconds, so 17,280 ledgers ≈ 1 day.
+/// `BUMP_AMOUNT` is the lifetime written on every touch; `BUMP_THRESHOLD`
+/// is how close to expiry an entry must be before a bump applies. The
+/// 30-day horizon comfortably covers a royalty configuration between keeper
+/// touches.
+mod ttl {
+    pub const DAY_IN_LEDGERS: u32 = 17_280;
+    /// Lifetime applied on every TTL touch.
+    pub const BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
+    /// Bump only when the entry is within this window of expiring.
+    pub const BUMP_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
+}
+
+/// Bump a persistent entry's TTL to the [`ttl::BUMP_AMOUNT`] horizon when
+/// it falls inside [`ttl::BUMP_THRESHOLD`].
+fn bump_entry(env: &Env, key: &DataKey) {
+    env.storage()
+        .persistent()
+        .extend_ttl(key, ttl::BUMP_THRESHOLD, ttl::BUMP_AMOUNT);
+}
+
+/// Persistent-storage keys.
 #[contracttype]
 enum DataKey {
-    /// The royalty configuration for `Address` collection.
+    /// The royalty configuration for `Address` collection (persistent storage).
     Royalty(Address),
-    /// The cumulative settlement totals for `Address` collection.
+    /// The cumulative settlement totals for `Address` collection (persistent storage).
     Summary(Address),
 }
 
@@ -236,9 +271,10 @@ impl MarketplaceRoyalties {
             bps,
             status: RoyaltyStatus::Active,
         };
-        env.storage()
-            .instance()
-            .set(&DataKey::Royalty(royalty.collection.clone()), &royalty);
+        let key = DataKey::Royalty(royalty.collection.clone());
+        env.storage().persistent().set(&key, &royalty);
+        bump_entry(&env, &key);
+        events::royalty_configured(&env, &royalty);
         Ok(())
     }
 
@@ -257,7 +293,7 @@ impl MarketplaceRoyalties {
     ) -> Result<i128, ForgeError> {
         let royalty: Royalty = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Royalty(collection.clone()))
             .ok_or(ForgeError::NotFound)?;
         if amount <= 0 {
@@ -294,7 +330,7 @@ impl MarketplaceRoyalties {
     ) -> Result<Settlement, ForgeError> {
         let royalty: Royalty = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Royalty(collection.clone()))
             .ok_or(ForgeError::NotFound)?;
         if amount <= 0 {
@@ -319,9 +355,22 @@ impl MarketplaceRoyalties {
         }
 
         // Both transfers succeeded; only now commit settlement state.
-        env.storage()
-            .instance()
-            .set(&DataKey::Summary(collection), &summary);
+        let summary_key = DataKey::Summary(collection.clone());
+        let royalty_key = DataKey::Royalty(collection.clone());
+        env.storage().persistent().set(&summary_key, &summary);
+        bump_entry(&env, &royalty_key);
+        bump_entry(&env, &summary_key);
+        events::sale_settled(
+            &env,
+            &collection,
+            &token,
+            &payer,
+            &seller,
+            &royalty.recipient,
+            amount,
+            seller_net,
+            royalty_share,
+        );
 
         Ok(Settlement {
             royalty_share,
@@ -359,7 +408,7 @@ impl MarketplaceRoyalties {
     ) -> Result<soroban_sdk::Vec<Settlement>, ForgeError> {
         let royalty: Royalty = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Royalty(collection.clone()))
             .ok_or(ForgeError::NotFound)?;
         let count = sales.len();
@@ -421,9 +470,11 @@ impl MarketplaceRoyalties {
         }
 
         // Every transfer succeeded; only now commit settlement state, once.
-        env.storage()
-            .instance()
-            .set(&DataKey::Summary(collection), &summary);
+        let summary_key = DataKey::Summary(collection.clone());
+        let royalty_key = DataKey::Royalty(collection);
+        env.storage().persistent().set(&summary_key, &summary);
+        bump_entry(&env, &royalty_key);
+        bump_entry(&env, &summary_key);
 
         Ok(settlements)
     }
@@ -431,7 +482,7 @@ impl MarketplaceRoyalties {
     /// Read the stored royalty configuration for `collection` (read-only view).
     pub fn get_royalty(env: Env, collection: Address) -> Result<Royalty, ForgeError> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Royalty(collection))
             .ok_or(ForgeError::NotFound)
     }
@@ -443,9 +494,26 @@ impl MarketplaceRoyalties {
         collection: Address,
     ) -> Result<SettlementSummary, ForgeError> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Summary(collection))
             .ok_or(ForgeError::NotFound)
+    }
+
+    /// Permissionless keeper: bump the royalty and summary entries' TTL without changing
+    /// any state.
+    ///
+    /// Returns `ForgeError::NotFound` if no royalty configuration exists for `collection`.
+    pub fn touch_ttl(env: Env, collection: Address) -> Result<(), ForgeError> {
+        let royalty_key = DataKey::Royalty(collection.clone());
+        if !env.storage().persistent().has(&royalty_key) {
+            return Err(ForgeError::NotFound);
+        }
+        bump_entry(&env, &royalty_key);
+        let summary_key = DataKey::Summary(collection);
+        if env.storage().persistent().has(&summary_key) {
+            bump_entry(&env, &summary_key);
+        }
+        Ok(())
     }
 }
 
@@ -491,7 +559,7 @@ fn next_summary(
 ) -> Result<SettlementSummary, ForgeError> {
     let current: Option<SettlementSummary> = env
         .storage()
-        .instance()
+        .persistent()
         .get(&DataKey::Summary(collection.clone()));
     let summary = match current {
         None => SettlementSummary {
@@ -543,6 +611,66 @@ fn transfer(
     }
 }
 
+/// Lifecycle events emitted by the marketplace royalties contract.
+mod events {
+    use super::*;
+
+    #[contractevent]
+    pub struct RoyaltyConfigured {
+        #[topic]
+        pub collection: Address,
+        pub recipient: Address,
+        pub bps: u32,
+    }
+
+    #[contractevent]
+    pub struct SaleSettled {
+        #[topic]
+        pub collection: Address,
+        pub token: Address,
+        pub payer: Address,
+        pub seller: Address,
+        pub royalty_recipient: Address,
+        pub gross_amount: i128,
+        pub seller_net: i128,
+        pub royalty_share: i128,
+    }
+
+    pub fn royalty_configured(env: &Env, royalty: &Royalty) {
+        RoyaltyConfigured {
+            collection: royalty.collection.clone(),
+            recipient: royalty.recipient.clone(),
+            bps: royalty.bps,
+        }
+        .publish(env);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sale_settled(
+        env: &Env,
+        collection: &Address,
+        token: &Address,
+        payer: &Address,
+        seller: &Address,
+        royalty_recipient: &Address,
+        gross_amount: i128,
+        seller_net: i128,
+        royalty_share: i128,
+    ) {
+        SaleSettled {
+            collection: collection.clone(),
+            token: token.clone(),
+            payer: payer.clone(),
+            seller: seller.clone(),
+            royalty_recipient: royalty_recipient.clone(),
+            gross_amount,
+            seller_net,
+            royalty_share,
+        }
+        .publish(env);
+    }
+}
+
 #[cfg(test)]
 mod authz;
 #[cfg(test)]
@@ -552,7 +680,7 @@ mod props;
 mod tests {
     use super::*;
     use soroban_forge_test_utils::TestAccounts;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Events as _};
     use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
     use soroban_sdk::Env;
 
@@ -777,7 +905,7 @@ mod tests {
         };
         env.as_contract(&contract_id, || {
             env.storage()
-                .instance()
+                .persistent()
                 .set(&DataKey::Royalty(collection.clone()), &disabled);
         });
 
@@ -1425,7 +1553,7 @@ mod tests {
         };
         env.as_contract(&contract_id, || {
             env.storage()
-                .instance()
+                .persistent()
                 .set(&DataKey::Royalty(collection.clone()), &disabled);
         });
 
@@ -1446,5 +1574,49 @@ mod tests {
             .unwrap_err()
             .unwrap();
         assert_eq!(err, ForgeError::NotFound);
+    }
+
+    #[test]
+    fn touch_ttl_extends_and_keeps_state_intact() {
+        let (_env, token, _tc, _contract_id, client, accounts) = setup_settlement!();
+        let collection = &accounts.arbiter;
+        client.settle_sale(
+            collection,
+            &token,
+            &accounts.user1,
+            &accounts.user3,
+            &1_000_i128,
+        );
+
+        assert_eq!(client.touch_ttl(collection), ());
+        let royalty = client.get_royalty(collection);
+        assert_eq!(royalty.bps, 500);
+        let summary = client.get_settlement_summary(collection);
+        assert_eq!(summary.sales, 1);
+    }
+
+    #[test]
+    fn touch_ttl_unknown_collection_returns_not_found() {
+        let (env, client, _accounts) = setup!();
+        let unknown = Address::generate(&env);
+        let err = client.try_touch_ttl(&unknown).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::NotFound);
+    }
+
+    #[test]
+    fn events_emitted_on_set_royalty_and_settle() {
+        let (env, token, _tc, _contract_id, client, accounts) = setup_settlement!();
+        let collection = &accounts.arbiter;
+        client.set_royalty(collection, &accounts.user2, &500_u32);
+        client.settle_sale(
+            collection,
+            &token,
+            &accounts.user1,
+            &accounts.user3,
+            &1_000_i128,
+        );
+
+        let events = env.events().all();
+        assert!(!events.events().is_empty());
     }
 }

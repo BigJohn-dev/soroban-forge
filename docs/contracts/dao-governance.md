@@ -16,6 +16,7 @@ fn get_proposal(proposal_id) -> Result<Proposal, ForgeError>
 fn get_proposal_count() -> u64
 fn get_proposals(offset, limit) -> Result<Vec<Proposal>, ForgeError>
 fn has_voted(proposal_id, voter) -> Result<bool, ForgeError>
+fn touch_ttl(proposal_id) -> Result<(), ForgeError>
 ```
 
 
@@ -109,3 +110,11 @@ The contract emits structured events for all state changes using the standard `p
 Whenever a bond moves, the bond token's own `transfer` event appears in the
 same invocation. Indexers should filter events by the emitting contract
 address to separate the DAO's records from the token's.
+
+## Storage & TTL Maintenance
+
+Proposal records (`DataKey::Proposal(u64)`) are stored in persistent storage. `DataKey::Count`, `DataKey::Bond`, `DataKey::BondHeld`, and `DataKey::Vote` entries remain in instance storage.
+
+`propose`, `vote`, `execute`, and `cancel_proposal` extend proposal persistent storage TTL on every write to a 30-day horizon (`30 * DAY_IN_LEDGERS = 518,400` ledgers).
+
+A permissionless public keeper entrypoint `touch_ttl(proposal_id)` allows anyone to bump a proposal's persistent TTL without modifying its state. If the proposal ID does not exist, `touch_ttl` returns `ForgeError::NotFound`.

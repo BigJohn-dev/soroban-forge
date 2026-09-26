@@ -14,6 +14,7 @@ fn settle_sale(collection, token, payer, seller, amount) -> Result<Settlement, F
 fn settle_sales(collection, token, payer, sales: Vec<(seller, amount)>) -> Result<Vec<Settlement>, ForgeError>
 fn get_royalty(collection) -> Result<Royalty, ForgeError>
 fn get_settlement_summary(collection) -> Result<SettlementSummary, ForgeError>
+fn touch_ttl(collection) -> Result<(), ForgeError>
 ```
 
 ## Concepts
@@ -93,7 +94,18 @@ they were before the call (no sale is half-settled).
 `Settlement`/`SettlementSummary` are shared by both settlement
 entrypoints.
 
-## Storage
+## Storage & TTL Maintenance
 
-Instance storage: one `Royalty` record and one `SettlementSummary` record
-per collection.
+Persistent storage: `Royalty` configuration records (`DataKey::Royalty(Address)`) and `SettlementSummary` records (`DataKey::Summary(Address)`).
+
+`set_royalty`, `settle_sale`, and `settle_sales` extend persistent storage TTL on every write to a 30-day horizon (`30 * DAY_IN_LEDGERS = 518,400` ledgers).
+
+A permissionless public keeper entrypoint `touch_ttl(collection)` allows anyone to bump persistent storage TTL for a collection's `Royalty` and `Summary` records. If no royalty configuration exists for `collection`, `touch_ttl` returns `ForgeError::NotFound`.
+
+## Events
+
+The contract emits typed on-chain lifecycle events for indexers and off-chain monitoring:
+
+- `RoyaltyConfigured` (topic: `collection: Address`) — emitted when a royalty configuration is registered or updated via `set_royalty`. Contains `recipient` and `bps`.
+- `SaleSettled` (topic: `collection: Address`) — emitted on sale settlement via `settle_sale` or `settle_sales`. Contains `token`, `payer`, `seller`, `royalty_recipient`, `gross_amount`, `seller_net`, and `royalty_share`.
+
