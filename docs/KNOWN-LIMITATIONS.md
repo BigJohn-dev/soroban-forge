@@ -11,21 +11,16 @@ decision — not an oversight.
 ## Resolved in the SDK 27 / Phase 1 migration
 
 These were the headline gaps in v0.1.0; all are closed **for the escrow
-contract** and remain open for the other five:
+contract** and remain open for the other four:
 
 1. **No token settlement** — escrow now performs real SEP-41 transfers
    (`deposit` pulls from the buyer, `release`/`refund`/`resolve` pay out)
    with transfer-before-state ordering so a failed transfer leaves no
-   partial state. Marketplace royalties and vesting have since gained
-   settlement the same way; DAO governance and subscriptions still move
-   nothing.
-2. **Instance-only storage** — escrow records now live in per-id
-   **persistent** entries with TTL bumps on every write and a
-   permissionless `touch_ttl` keeper entrypoint. The other five still use
-   instance storage exclusively.
-3. **No events** — escrow emits `EscrowCreated`, `Deposited`, `Released`,
-   `Refunded`, `Disputed`, `Resolved`, `Cancelled` (escrow id as topic).
-   The other five are still silent.
+   partial state. Marketplace royalties, vesting, and DAO governance
+   (proposal bonds) have since gained settlement the same way;
+   subscriptions still move nothing.
+2. **Instance-only storage** — escrow, multi-sig wallet, DAO governance, and marketplace royalties now use **persistent** entries with TTL bumps on every write and permissionless `touch_ttl` keeper entrypoints. Vesting and subscriptions still use instance storage.
+3. **No events** — escrow, multi-sig wallet, DAO governance, subscription payments, and marketplace royalties emit lifecycle events; only vesting remains silent.
 4. **Arbiter stored but unreachable** — `dispute` (claimant-authorized)
    and `resolve` (arbiter-only, final) make the third party live.
    `Disputed` is a real state, verified by tests.
@@ -35,50 +30,50 @@ contract** and remain open for the other five:
 
 ## Still open
 
-### 1. Token settlement for the remaining two contracts
+### 1. Token settlement for subscription payments
 
-DAO governance and subscriptions remain state
-machines: amounts are validated and stored, never moved.
-(Marketplace royalties moved off this list: `settle_sale` transfers
+Subscriptions remain state machines: amounts are validated and stored, never
+moved. (Marketplace royalties moved off this list: `settle_sale` transfers
 real SEP-41 tokens with the escrow pattern. Multi-sig wallet also
 moved off this list: `execute` performs real cross-contract
 invocations via `try_invoke_contract`. Vesting also moved off this
 list: `claim` transfers the vested amount to the beneficiary with
-transfer-before-state ordering.) Each remaining contract gets
-its own tranche using the escrow pattern (see
+transfer-before-state ordering. DAO governance also moved off this list:
+`propose` pulls a SEP-41 proposal bond into contract custody and the bond is
+refunded to the proposer (`Executed`, `Cancelled`) or forfeited to the
+configured treasury (`Defeated`) in the same frame as the terminal
+transition.) The remaining contract gets its own tranche using the escrow
+pattern (see
 [RESUBMISSION.md](RESUBMISSION.md#phase-1--flagship-escrow-primitive-3-weeks)).
 
-### 2. Instance-only storage outside escrow
+### 2. Instance-only storage outside escrow, multi-sig wallet, DAO governance, and marketplace royalties
 
-The other five contracts keep all state in `env.storage().instance()`.
+Vesting and subscriptions keep state in `env.storage().instance()`.
 Long-lived records there still face the byte budget and TTL-expiry
-bricking problem. Migrate per contract with the escrow pattern. Vesting
-is where the byte budget bites first: a tranche schedule's immutable
-unlock table lives in the same instance entry as every other schedule
-(capped at `MAX_TRANCHES` = 32 entries per schedule, which bounds the
-per-record cost but not the number of records).
+bricking problem. (Escrow, multi-sig wallet, DAO governance, and marketplace royalties migrated per-record data to persistent storage with `touch_ttl` keeper entrypoints).
 
-### 3. No events outside escrow
+### 3. No events in vesting contract
 
-Only escrow is observable on-chain. The rest need event modules before
-any indexer or SDK integration.
+Vesting remains without an event module. Escrow, multi-sig wallet, DAO governance, subscription payments, and marketplace royalties emit typed on-chain events.
 
-### 4. Negative authorization coverage outside escrow
 
-**Closed for escrow** (was the open item here): a dedicated negative-auth
-suite (`crates/escrow/src/authz.rs`) proves per entrypoint that a wrong
-signer is rejected by the host, that armed signatures cannot be replayed
-over different arguments, and — via `env.auths()` tree assertions — pins
-the exact authorized-invocation tree every payout path demands. It also
-documents the verified mechanics: contract self-authorization is implicit
-(the host auto-approves `require_auth` from the executing contract), which
-is why a party signature alone legitimately completes a payout.
+### 4. Negative authorization coverage outside escrow, vesting, and DAO governance
 
-Still open: the other five contracts' entrypoints are proven at call-graph
-level only. Vesting's `claim` now moves tokens, so its settlement path is
-covered by balance-asserted tests but not yet by a negative-auth suite;
-DAO governance and subscriptions still move nothing, keeping theirs lower
-priority until their settlement tranches.
+**Closed for escrow, vesting, and DAO governance** (was the open item here): dedicated
+negative-auth suites (`crates/escrow/src/authz.rs`, `crates/vesting/src/authz.rs`,
+`crates/dao-governance/src/authz.rs`) prove per entrypoint that a wrong signer is
+rejected by the host, that armed signatures cannot be replayed over different
+arguments or schedule IDs, and — via `env.auths()` tree assertions — pin the exact
+authorized-invocation tree every creation and payout path demands. The DAO suite
+additionally covers the bond-bearing paths: the proposer's signature must carry the
+nested token `transfer` authorization for the bond pull, and the outgoing
+refund/forfeit transfers are covered by contract self-authorization (blank envelope).
+They also document the verified mechanics: contract self-authorization is implicit
+(the host auto-approves `require_auth` from the executing contract), which is why
+a party signature alone legitimately completes a payout.
+
+Still open: the other three contracts' entrypoints are proven at call-graph
+level only; subscriptions still move nothing.
 
 ### 5. Vesting rounding residue
 
@@ -150,6 +145,7 @@ contributions have landed yet.
 
 ## Out of scope for the flagship phase (deliberate)
 
-- Settlement work for the five non-flagship contracts (one tranche each)
+- Settlement work for subscription payments (the last contract that never
+  moves tokens)
 - Weighted voting, plan management, multi-recipient royalties
 - Formal verification, external audit (planned before any mainnet use)

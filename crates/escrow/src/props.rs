@@ -2,11 +2,13 @@
 //!
 //! The hand-written suite pins behaviour on known values; this module tries
 //! to *falsify* the contract's fund-safety claims over generated inputs.
-//! Three properties are exercised:
+//! Four properties are exercised:
 //!
 //! **P1 — Conservation.** On every terminal path, for random amounts,
 //! timeouts, dispute claimants and resolution directions: the contract ends
-//! holding zero and the parties' gain equals the deposit exactly.
+//! holding zero and the parties' gain equals the deposit exactly. Paths now
+//! include randomized bounded sequences of `release_partial` before the
+//! terminal action.
 //!
 //! **P2 — Tamper-resilient conservation.** An attacker who can rewrite the
 //! contract's persistent storage between calls (the strongest adversary the
@@ -16,10 +18,11 @@
 //! balance check rather than paying out.
 //!
 //! **P3 — Fund safety over arbitrary sequences.** For random sequences of
-//! `deposit / release / refund / dispute / resolve`: each call succeeds only
-//! when the mirrored state machine says it must, outsider disputes are always
-//! rejected, no state transition ever changes the pool total, and terminal
-//! escrows are never payable twice.
+//! `deposit / release / release_partial / refund / dispute / resolve`: each
+//! call succeeds only when the mirrored state machine says it must, outsider
+//! disputes are always rejected, no state transition ever changes the pool
+//! total, and terminal escrows are never payable twice. The mirror state
+//! machine now tracks `released` alongside the lifecycle state.
 //!
 //! All properties run against a real Stellar Asset Contract, so balances
 //! reflect actual token movement. Runs are deterministic (fixed default
@@ -136,6 +139,11 @@ fn terminal_path() -> impl Strategy<Value = u8> {
     0u8..=2 // 0 = release, 1 = refund (pre-deadline), 2 = dispute -> resolve
 }
 
+/// A partial-release fraction 1..=9 (tenths of total amount).
+fn partial_fraction() -> impl Strategy<Value = u8> {
+    1u8..=9
+}
+
 // -----------------------------------------------------------------------
 // P1 — conservation on random terminal paths (no tampering)
 // -----------------------------------------------------------------------
@@ -181,6 +189,95 @@ proptest! {
         prop_assert_eq!(b1 + s1 + a1, b0 + s0 + c0, "parties' gain must equal the deposit exactly");
         let status = w.escrow_client().get_status(&id);
         prop_assert!(status == EscrowStatus::Completed || status == EscrowStatus::Refunded);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// P1-partial: conservation after a bounded partial-release sequence
+    /// then a terminal action. Verifies:
+    /// - pool is conserved after every partial release
+    /// - terminal action pays out remaining balance
+    /// - released + remaining == deposited throughout
+    /// - refund/resolve operate only on remaining balance
+    /// - terminal state is correct
+    #[test]
+    fn p1_conservation_with_partial_release_sequences(
+        amount in 10i128..=MAX_AMOUNT,
+        timeout in 1u64..=MAX_TIMEOUT,
+        // A sequence of (numerator, denominator) fractions of the *original*
+        // amount; clamped to remaining so the sequence always stays valid.
+        fracs in prop::collection::vec((1u8..=9, 1u8..=10), 0..=8),
+        terminal in terminal_path(),
+        claimant in claimant_pick(),
+        pay_seller in prop::bool::ANY,
+    ) {
+        let w = setup_world();
+        w.mint_to_buyer(amount);
+        let id = w.create(amount, timeout);
+        w.escrow_client().deposit(&id);
+
+        let before = w.pool_total();
+
+        // Apply partial releases, clamping each to remaining.
+        for (num, den) in &fracs {
+            let record: EscrowData = w.escrow_client().get_escrow(&id);
+            let remaining = record.remaining();
+            if remaining == 0 || record.status != EscrowStatus::Funded {
+                break;
+            }
+            // fraction of the original amount, clamped to [1, remaining].
+            let partial = ((amount * i128::from(*num)) / i128::from(*den)).max(1).min(remaining);
+            let res = w.escrow_client().try_release_partial(&id, &partial);
+            prop_assert!(matches!(res, Ok(Ok(()))),
+                "valid partial release must succeed: amount={amount} partial={partial} remaining={remaining}");
+
+            // Accounting invariant after every partial.
+            let after_record: EscrowData = w.escrow_client().get_escrow(&id);
+            prop_assert_eq!(after_record.released + after_record.remaining(), after_record.amount,
+                "released + remaining must always equal deposited amount");
+
+            // Pool total must be unchanged after every partial.
+            prop_assert_eq!(w.pool_total(), before,
+                "pool must be conserved after partial release");
+        }
+
+        // Now apply the terminal action if the escrow is still Funded.
+        let status = w.escrow_client().get_status(&id);
+        if status == EscrowStatus::Funded {
+            match terminal {
+                0 => { w.escrow_client().release(&id); }
+                1 => { w.escrow_client().refund(&id); }
+                _ => {
+                    let claimant_addr = match claimant {
+                        0 => &w.buyer,
+                        _ => &w.seller,
+                    };
+                    w.escrow_client().dispute(&id, claimant_addr);
+                    w.escrow_client().resolve(&id, &pay_seller);
+                }
+            }
+        }
+
+        // Final invariants.
+        let (_, _, _, c1) = w.pool();
+        prop_assert_eq!(c1, 0, "contract must hold nothing after terminal action");
+        prop_assert_eq!(w.pool_total(), before,
+            "pool total must be conserved end-to-end");
+
+        let final_status = w.escrow_client().get_status(&id);
+        prop_assert!(
+            final_status == EscrowStatus::Completed || final_status == EscrowStatus::Refunded,
+            "escrow must be terminal after the terminal action"
+        );
+
+        // Remaining balance in the record must be zero at terminal.
+        let record: EscrowData = w.escrow_client().get_escrow(&id);
+        prop_assert_eq!(record.remaining(), 0,
+            "remaining must be zero in terminal escrow");
+        prop_assert_eq!(record.released, record.amount,
+            "released must equal amount in terminal escrow");
     }
 }
 
@@ -243,7 +340,10 @@ fn mutate_record(w: &World, id: u64, kind: u8, add: i128, sub: i128, overwrite: 
                     _ => EscrowStatus::Cancelled,
                 };
             }
-            _ => unreachable!("strategy bounds"),
+            // Fuzz the released field.
+            _ => {
+                rec.released = overwrite.abs().min(rec.amount.abs());
+            }
         }
 
         w.env.storage().persistent().set(&key, &rec);
@@ -257,7 +357,7 @@ proptest! {
     fn p2_tampered_storage_never_moves_value_out_of_the_pool(
         amount in 1i128..=MAX_AMOUNT,
         timeout in 1u64..=MAX_TIMEOUT,
-        muts in prop::collection::vec((0u8..=4, arb_delta(), arb_delta(), arb_delta()), 0..=6),
+        muts in prop::collection::vec((0u8..=5, arb_delta(), arb_delta(), arb_delta()), 0..=6),
         pay_seller in prop::bool::ANY,
     ) {
         let w = setup_world();
@@ -311,9 +411,17 @@ proptest! {
 // P3 — fund safety over arbitrary call sequences
 // -----------------------------------------------------------------------
 
-/// (op, claimant_pick, pay_seller)
-fn action_strategy() -> impl Strategy<Value = (u8, u8, bool)> {
-    (0u8..=4, claimant_pick(), prop::bool::ANY)
+/// (op, claimant_pick, pay_seller, partial_frac)
+///
+/// ops: 0=deposit, 1=release, 2=refund, 3=dispute, 4=resolve,
+///      5=release_partial (frac/10 of the original amount, clamped to remaining)
+fn action_strategy() -> impl Strategy<Value = (u8, u8, bool, u8)> {
+    (
+        0u8..=5,
+        claimant_pick(),
+        prop::bool::ANY,
+        partial_fraction(),
+    )
 }
 
 proptest! {
@@ -323,7 +431,7 @@ proptest! {
     fn p3_sequences_never_violate_fund_safety(
         amount in 1i128..=MAX_AMOUNT,
         timeout in 1u64..=MAX_TIMEOUT,
-        actions in prop::collection::vec(action_strategy(), 0..=10),
+        actions in prop::collection::vec(action_strategy(), 0..=12),
     ) {
         use EscrowStatus::{Cancelled, Completed, Disputed, Funded, Pending, Refunded};
 
@@ -335,8 +443,10 @@ proptest! {
         // The contract's own state machine, mirrored independently. Every
         // call is checked against this mirror; a mismatch is a failure.
         let mut state = Funded;
+        // Mirror of the released accounting.
+        let mut mirror_released: i128 = 0;
 
-        for (op, claimant, pay_seller) in actions {
+        for (op, claimant, pay_seller, frac) in actions {
             let client = w.escrow_client();
             let before = w.pool_total();
 
@@ -352,12 +462,13 @@ proptest! {
                         _ => prop_assert!(res.is_err(), "deposit must fail unless Pending"),
                     }
                 }
-                // release
+                // release (full remaining)
                 1 => {
                     let res = client.try_release(&id);
                     match state {
                         Funded => {
                             prop_assert!(matches!(res, Ok(Ok(()))), "release must succeed while Funded");
+                            mirror_released = amount;
                             state = Completed;
                         }
                         _ => prop_assert!(res.is_err(), "release must fail unless Funded"),
@@ -370,6 +481,7 @@ proptest! {
                     match state {
                         Funded => {
                             prop_assert!(matches!(res, Ok(Ok(()))), "post-deadline refund must succeed while Funded");
+                            mirror_released = amount;
                             state = Refunded;
                         }
                         _ => prop_assert!(res.is_err(), "refund must fail unless Funded"),
@@ -400,20 +512,57 @@ proptest! {
                     }
                 }
                 // resolve
-                _ => {
+                4 => {
                     let res = client.try_resolve(&id, &pay_seller);
                     match state {
                         Disputed => {
                             prop_assert!(matches!(res, Ok(Ok(()))), "resolve must succeed while Disputed");
+                            mirror_released = amount;
                             state = if pay_seller { Completed } else { Refunded };
                         }
                         _ => prop_assert!(res.is_err(), "resolve must fail unless Disputed"),
+                    }
+                }
+                // release_partial: frac/10 of original amount, clamped to remaining
+                _ => {
+                    let remaining = amount.saturating_sub(mirror_released);
+                    let partial = if remaining > 0 {
+                        ((amount * i128::from(frac)) / 10).max(1).min(remaining)
+                    } else {
+                        1 // will be rejected (remaining == 0 or wrong state)
+                    };
+                    let res = client.try_release_partial(&id, &partial);
+                    match state {
+                        Funded if remaining > 0 => {
+                            prop_assert!(matches!(res, Ok(Ok(()))),
+                                "valid release_partial must succeed: partial={partial} remaining={remaining}");
+                            mirror_released = mirror_released.saturating_add(partial);
+                            // Final partial completes the escrow.
+                            if partial == remaining {
+                                state = Completed;
+                            }
+                        }
+                        _ => {
+                            prop_assert!(res.is_err(),
+                                "release_partial must fail when state={:?} remaining={remaining}", state);
+                        }
                     }
                 }
             }
 
             prop_assert_eq!(w.pool_total(), before,
                 "no call may change the pool total outside a payout from the contract");
+
+            // Mirror accounting consistency after every step.
+            if matches!(state, Funded | Disputed) {
+                let record: EscrowData = w.escrow_client().get_escrow(&id);
+                prop_assert_eq!(record.released, mirror_released,
+                    "released field must match mirror after step");
+                prop_assert_eq!(record.remaining(), amount - mirror_released,
+                    "remaining() must equal amount - mirror_released");
+                prop_assert_eq!(record.released + record.remaining(), record.amount,
+                    "accounting identity: released + remaining == amount");
+            }
         }
 
         // If the sequence reached a terminal state, it must be genuinely
@@ -424,9 +573,17 @@ proptest! {
             let client = w.escrow_client();
             prop_assert!(client.try_deposit(&id).is_err());
             prop_assert!(client.try_release(&id).is_err());
+            prop_assert!(client.try_release_partial(&id, &1).is_err());
             prop_assert!(client.try_refund(&id).is_err());
             prop_assert!(client.try_dispute(&id, &w.buyer).is_err());
             prop_assert!(client.try_resolve(&id, &true).is_err());
+
+            // Remaining and released must be fully accounted in terminal records.
+            let record: EscrowData = w.escrow_client().get_escrow(&id);
+            prop_assert_eq!(record.remaining(), 0,
+                "terminal escrow remaining must be zero");
+            prop_assert_eq!(record.released, record.amount,
+                "terminal escrow released must equal deposited amount");
         }
         let _ = Cancelled; // Cancelled is unreachable here (no cancel op in P3's set)
     }

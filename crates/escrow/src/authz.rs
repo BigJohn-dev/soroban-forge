@@ -640,3 +640,227 @@ fn blank_envelope_aborts_create_and_writes_nothing() {
     let id = client.create_escrow(buyer, seller, arbiter, &token, &AMOUNT, &TIMEOUT);
     assert_eq!(id, 1);
 }
+
+// -----------------------------------------------------------------------
+// release_partial
+// -----------------------------------------------------------------------
+
+#[test]
+fn release_partial_rejects_buyer_signature() {
+    let (env, token, tc, contract_id, client, accounts) = setup!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let id = client.create_escrow(buyer, seller, arbiter, &token, &AMOUNT, &TIMEOUT);
+    client.deposit(&id);
+
+    // Buyer attempts to collect a partial release — must be rejected.
+    env.mock_auths(&[MockAuth {
+        address: buyer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "release_partial",
+            args: (id, AMOUNT / 2).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_release_partial(&id, &(AMOUNT / 2));
+    assert_auth_abort!(res);
+    assert_eq!(tc.balance(&contract_id), AMOUNT);
+    assert_eq!(tc.balance(seller), 0);
+    assert_eq!(client.get_status(&id), crate::EscrowStatus::Funded);
+}
+
+#[test]
+fn release_partial_accepts_seller_signature() {
+    let (env, token, tc, contract_id, client, accounts) = setup!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let id = client.create_escrow(buyer, seller, arbiter, &token, &AMOUNT, &TIMEOUT);
+    client.deposit(&id);
+
+    // Positive control: seller's signature is sufficient.
+    env.mock_auths(&[MockAuth {
+        address: seller,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "release_partial",
+            args: (id, AMOUNT / 2).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    client
+        .try_release_partial(&id, &(AMOUNT / 2))
+        .expect("outer ok")
+        .unwrap();
+    assert_eq!(tc.balance(seller), AMOUNT / 2);
+    assert_eq!(tc.balance(&contract_id), AMOUNT - AMOUNT / 2);
+}
+
+#[test]
+fn release_partial_rejects_arbiter_signature() {
+    let (env, token, tc, contract_id, client, accounts) = setup!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let id = client.create_escrow(buyer, seller, arbiter, &token, &AMOUNT, &TIMEOUT);
+    client.deposit(&id);
+
+    env.mock_auths(&[MockAuth {
+        address: arbiter,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "release_partial",
+            args: (id, AMOUNT / 2).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_release_partial(&id, &(AMOUNT / 2));
+    assert_auth_abort!(res);
+    assert_eq!(tc.balance(&contract_id), AMOUNT);
+}
+
+#[test]
+fn release_partial_rejects_signature_over_different_amount() {
+    let (env, token, tc, contract_id, client, accounts) = setup!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let id = client.create_escrow(buyer, seller, arbiter, &token, &AMOUNT, &TIMEOUT);
+    client.deposit(&id);
+
+    // Seller signs for one amount but the invocation sends a different amount.
+    env.mock_auths(&[MockAuth {
+        address: seller,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "release_partial",
+            args: (id, AMOUNT / 2 + 100).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_release_partial(&id, &(AMOUNT / 2));
+    assert_auth_abort!(res);
+    assert_eq!(tc.balance(&contract_id), AMOUNT);
+}
+
+#[test]
+fn release_partial_authorization_tree_is_seller_only() {
+    // Contract self-auth is implicit; the seller's entrypoint frame is the
+    // only entry in env.auths() — same as release and refund.
+    let (env, token, _tc, contract_id, client, accounts) = setup!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let id = client.create_escrow(buyer, seller, arbiter, &token, &AMOUNT, &TIMEOUT);
+    client.deposit(&id);
+
+    client.release_partial(&id, &(AMOUNT / 3));
+
+    assert_eq!(
+        env.auths(),
+        [(
+            seller.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    contract_id.clone(),
+                    Symbol::new(&env, "release_partial"),
+                    (id, AMOUNT / 3).into_val(&env),
+                )),
+                // Self-auth is implicit; entrypoint frame only.
+                sub_invocations: std::vec![],
+            },
+        )],
+    );
+}
+
+#[test]
+fn blank_envelope_aborts_release_partial() {
+    let (env, token, tc, contract_id, client, accounts) = setup!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let id = client.create_escrow(buyer, seller, arbiter, &token, &AMOUNT, &TIMEOUT);
+    client.deposit(&id);
+
+    env.set_auths(&[]);
+
+    let res = client.try_release_partial(&id, &(AMOUNT / 2));
+    assert_auth_abort!(res);
+    assert_eq!(tc.balance(&contract_id), AMOUNT);
+    assert_eq!(tc.balance(seller), 0);
+    assert_eq!(client.get_status(&id), crate::EscrowStatus::Funded);
+}
+
+// -----------------------------------------------------------------------
+// Mutation verification for release_partial require_auth
+//
+// Procedure:
+// 1. This test confirms the NEGATIVE path: when require_auth is absent,
+//    a buyer signature on release_partial must be rejected by the host.
+// 2. The POSITIVE path is covered by release_partial_accepts_seller_signature.
+//
+// To manually verify the mutation test:
+//   a. Temporarily comment out `escrow.seller.require_auth();` in
+//      `release_partial` in lib.rs.
+//   b. Run: cargo test -p soroban-forge-escrow authz::release_partial_rejects_buyer_signature
+//      → The test should FAIL (buyer's call succeeds without the guard).
+//   c. Restore the require_auth line.
+//   d. Run the same test again → it should PASS.
+//
+// The test below documents this invariant in CI. It uses a blank envelope
+// (set_auths(&[])) which exercises the same code path: without require_auth,
+// no auth check occurs and the call would succeed; with require_auth, the
+// host aborts.
+// -----------------------------------------------------------------------
+
+#[test]
+fn release_partial_mutation_test_no_auth_aborts() {
+    // With require_auth in place:
+    // - A blank auth envelope must abort the call.
+    // Without require_auth (mutation):
+    // - The call would succeed — this is what the mutation test detects.
+    let (env, token, tc, contract_id, client, accounts) = setup!();
+    let buyer = &accounts.user1;
+    let seller = &accounts.user2;
+    let arbiter = &accounts.arbiter;
+    let id = client.create_escrow(buyer, seller, arbiter, &token, &AMOUNT, &TIMEOUT);
+    client.deposit(&id);
+
+    // Blank envelope: every require_auth fails.
+    env.set_auths(&[]);
+
+    let res = client.try_release_partial(&id, &(AMOUNT / 2));
+    // MUST be Abort: if require_auth were removed, this would be Ok(Ok(())).
+    assert_auth_abort!(res);
+
+    // Storage and balances must be untouched.
+    assert_eq!(tc.balance(&contract_id), AMOUNT, "custody must be intact");
+    assert_eq!(
+        tc.balance(seller),
+        0,
+        "seller must not have received anything"
+    );
+
+    // Re-arm with the correct seller signature to prove the positive path
+    // (and that the escrow itself is intact and can still be used).
+    env.mock_auths(&[MockAuth {
+        address: seller,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "release_partial",
+            args: (id, AMOUNT / 2).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client
+        .try_release_partial(&id, &(AMOUNT / 2))
+        .expect("outer ok")
+        .expect("seller auth must succeed after auth is restored");
+    assert_eq!(tc.balance(seller), AMOUNT / 2);
+}

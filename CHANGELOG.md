@@ -8,28 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Tranche vesting schedules** (`create_tranche_schedule`): a second
-  schedule shape whose unlock table is an explicit, ordered list of
-  `(unlock_at, amount)` tranches, so a grant agreement like "25% at TGE, 25%
-  at +6 months, 50% at +12 months" is expressible instead of approximated with
-  several schedules and custody pots. Additive by design: a new
-  `TrancheSchedule` record type plus a `DataKey::TrancheSchedule` variant, so
-  the linear record's wire shape and its floor-division math (Known
-  Limitations §5) are untouched; both kinds share the one monotonic id
-  counter and the one claim path. `claim`/`claimable`/`get_status` are
-  kind-aware, and `get_tranche_schedule` is the tranche-side record view
-  (the linear `get_schedule` view is tracked separately). The vested amount is
-  the cumulative sum of every tranche whose offset has elapsed — a step
-  function, not a ramp — computed by a bounded scan (tables are capped at
-  `MAX_TRANCHES = 32` and stored once, immutable), with checked arithmetic on
-  every cumulative sum and progress compared on the elapsed offset so a
-  `u64::MAX` offset cannot overflow. Settlement is unchanged: the SEP-41
-  transfer still runs before the state write, a zero claim issues no transfer,
-  and a failed transfer (underfunded contract, undeployed token) leaves
-  `claimed`/`status` untouched. 24 new tests (51 in the crate): table
-  validation, boundary claims at and around every unlock, real-SAC settlement
-  per step, interleaved claims at arbitrary timestamps with conservation,
-  transfer-failure and undeployed-token paths, and both kinds on one id space.
+- **Atomic batch settlement** for marketplace royalties
+  (`settle_sales`): settles up to `MAX_SETTLE_SALES` (20) sales of one
+  collection in a single invocation against one collection + one payer
+  authorization, so marketplaces can clear an order batch (or a payout
+  sweep) in one transaction instead of one per sale. Per-sale split math,
+  seller-then-recipient transfer order, and zero-share skips are identical
+  to `settle_sale`; every validation (config, cap, per-sale `amount > 0`,
+  aggregate split math checked against the stored summary) runs before the
+  first transfer, the cumulative summary is committed exactly once per call
+  with the batch's aggregate deltas, and any failure — including a later
+  sale's transfer after earlier sales succeeded — rolls the whole
+  invocation back. No new storage keys.
 - **Negative-authorization test suite** for escrow
   (`crates/escrow/src/authz.rs`, 19 tests): per entrypoint, proves a wrong
   signer is rejected by the host, that an armed signature cannot be

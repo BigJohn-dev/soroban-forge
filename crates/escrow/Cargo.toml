@@ -15,6 +15,8 @@ soroban-sdk.workspace = true
 soroban-forge-shared-utils = { path = "../shared-utils", version = "0.2.0" }
 
 [dev-dependencies]
-soroban-sdk = { workspace = true, features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils", "hazmat-address"] }
 soroban-forge-test-utils = { path = "../test-utils", version = "0.2.0" }
 proptest = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

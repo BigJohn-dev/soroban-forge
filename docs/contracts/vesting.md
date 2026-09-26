@@ -118,5 +118,32 @@ The contract custodies the SEP-41 token configured on the schedule, and
 - floor-division residue on the linear kind is never lost: it stays claimable
   between claims and is paid out by the final claim.
 
+## Storage Layout & Upgrade Compatibility
+
+The vesting contract uses instance storage partitioned into two distinct keys:
+
+```rust
+enum DataKey {
+    /// Holds a `VestingSchedule` record keyed by monotonic schedule id.
+    Schedule(u64),
+    /// Monotonic id counter (`u64`), initialized at 0 and incremented on each schedule creation.
+    Count,
+}
+```
+
+### Storage Model
+
+- **`DataKey::Count`**: Stores a single `u64` representing the highest allocated schedule id. Next id allocation uses checked addition (`checked_add(1)`), returning `ForgeError::ArithmeticOverflow` on counter saturation.
+- **`DataKey::Schedule(u64)`**: Stores the `VestingSchedule` struct containing beneficiary, token address, total amount, start timestamp, cliff duration, total duration, claimed amount, and derived lifecycle status.
+- Instance storage lifetime is bound to the contract instance. In environments with storage TTL expiration, the contract instance TTL must be maintained to prevent storage eviction.
+
+### Upgrade Compatibility
+
+- **Key Segregation**: Because `DataKey::Schedule(u64)` uses a tuple variant and `DataKey::Count` is a unit variant, keys occupy non-overlapping namespaces within instance storage.
+- **Record Schema Evolution**:
+  - The `VestingSchedule` struct is serialized via Soroban's `#[contracttype]`. Adding new fields to `VestingSchedule` in future contract versions must maintain backwards deserialization compatibility (e.g. using `Option<T>` for newly introduced optional fields, or migrating storage records upon upgrade).
+  - Storage key enums must preserve existing discriminant ordering if extended (e.g. adding new key variants for administrative roles or persistent storage migration).
+- **Storage Tier Migration**: If migrating from instance storage to persistent storage with per-schedule TTL management (mirroring the Escrow contract architecture), `DataKey::Schedule(u64)` entries can be migrated to persistent storage while retaining `DataKey::Count` in instance storage.
+
 Tests live in-crate (`crates/vesting/src/lib.rs`) and run with
 `cargo test -p soroban-forge-vesting --all-targets --locked`.

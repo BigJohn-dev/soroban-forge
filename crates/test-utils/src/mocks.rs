@@ -47,3 +47,59 @@ impl TestAccounts {
         v
     }
 }
+
+/// Mock target contract for testing cross-contract invocations.
+///
+/// Records the execution count and last dispatched payload in instance storage.
+#[soroban_sdk::contract]
+pub struct MockTarget;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MockTargetKey {
+    Count,
+    LastPayload,
+}
+
+#[soroban_sdk::contractimpl]
+impl MockTarget {
+    /// Dispatched by contracts executing actions via cross-contract calls.
+    pub fn execute(env: Env, payload: soroban_sdk::Bytes) {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&MockTargetKey::Count)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&MockTargetKey::Count, &(count + 1));
+        env.storage()
+            .instance()
+            .set(&MockTargetKey::LastPayload, &payload);
+    }
+
+    /// Read the number of times `execute` was called.
+    pub fn count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&MockTargetKey::Count)
+            .unwrap_or(0)
+    }
+
+    /// Read the last payload dispatched to `execute`.
+    pub fn last_payload(env: Env) -> Option<soroban_sdk::Bytes> {
+        env.storage().instance().get(&MockTargetKey::LastPayload)
+    }
+}
+
+/// A mock target whose `execute` panics, simulating a target revert.
+#[soroban_sdk::contract]
+pub struct RevertingTarget;
+
+#[soroban_sdk::contractimpl]
+impl RevertingTarget {
+    /// Panics on invocation, simulating a target revert.
+    pub fn execute(_env: Env, _payload: soroban_sdk::Bytes) {
+        panic!("target reverted");
+    }
+}

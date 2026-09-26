@@ -43,4 +43,10 @@ pub enum ForgeError {
     /// distinguish them from token-transfer failures, and the invoking
     /// transaction is left un-executed.
     ContractInvocationFailed = 12,
+    /// The requested withdrawal would push a token's rolling-window total
+    /// past its configured withdrawal limit. Kept distinct from
+    /// [`ForgeError::InvalidInput`] so a caller can tell a policy rejection
+    /// (a valid withdrawal that is too large right now) from a malformed
+    /// argument.
+    WithdrawalLimitExceeded = 13,
 }

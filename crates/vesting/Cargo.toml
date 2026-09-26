@@ -17,3 +17,5 @@ soroban-forge-shared-utils = { path = "../shared-utils", version = "0.2.0" }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 soroban-forge-test-utils = { path = "../test-utils", version = "0.2.0" }
+proptest = "1"
+

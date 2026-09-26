@@ -4,6 +4,22 @@ This guide covers the development workflow for Soroban Forge. All commands docum
 
 ## Prerequisites
 
+### Developer CLI (soroban-forge)
+
+Build and run the developer CLI:
+
+```bash
+# Build CLI binary
+cargo build -p soroban-forge-cli
+
+# Scaffold a new Soroban contract crate
+cargo run -p soroban-forge-cli -- new my-token
+
+# Scaffold with custom path
+cargo run -p soroban-forge-cli -- new my-token --path ./custom/path/my-token
+```
+
+
 ### Rust and Toolchain
 
 The project requires **stable Rust** and the `wasm32v1-none` target for Soroban contracts.
@@ -68,6 +84,46 @@ cargo build --locked --release --target wasm32v1-none \
   --package soroban-forge-dao-governance \
   --package soroban-forge-subscription-payments \
   --package soroban-forge-marketplace-royalties
+```
+
+### Build and Check WASM with the Developer CLI
+
+The CLI can build one contract or all six contract packages for the required
+`wasm32v1-none` target. WASM builds always use the optimized release profile.
+Use `--package` to select a single package; without it, the CLI builds all
+contract packages and skips the host-only CLI and shared utility crates.
+
+```bash
+# Build all contract WASM artifacts
+cargo run -p soroban-forge-cli -- build --wasm
+
+# Build one contract and verify its artifact against the 150,000-byte budget
+cargo run -p soroban-forge-cli -- build --wasm --check-size \
+  --package soroban-forge-escrow
+
+# Build all contracts and print a size table; --check-size implies --wasm
+cargo run -p soroban-forge-cli -- build --check-size
+```
+
+Size verification inspects `.wasm` files under
+`target/wasm32v1-none/release/` (or `$CARGO_TARGET_DIR/wasm32v1-none/release/`
+when `CARGO_TARGET_DIR` is set). It reports each artifact's byte and KB size,
+the 150,000-byte budget, and a `PASS` or `FAIL` status. If any artifact exceeds
+the budget, or no artifact is found for the selected package, the command exits
+with an error. If the target is missing, install it with
+`rustup target add wasm32v1-none` and rerun the build.
+
+Example output:
+
+```text
+Contract                                  Size (bytes)   Size (KB)   Budget (bytes)  Status
+----------------------------------------  ------------  ----------  ---------------  ------
+soroban_forge_dao_governance.wasm                12309       12.02           150000  PASS
+soroban_forge_escrow.wasm                        20425       19.94           150000  PASS
+soroban_forge_marketplace_royalties.wasm         15099       14.74           150000  PASS
+soroban_forge_multi_sig_wallet.wasm              23571       23.01           150000  PASS
+soroban_forge_subscription_payments.wasm         10877       10.62           150000  PASS
+soroban_forge_vesting.wasm                       14596       14.25           150000  PASS
 ```
 
 ## Test Commands

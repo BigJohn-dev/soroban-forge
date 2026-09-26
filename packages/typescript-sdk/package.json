@@ -14,13 +14,17 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc && tsc --project tsconfig.test.json && node --test dist-test/tests/escrow-client.test.js",
+    "verify:testnet": "npm run build && tsc --project tsconfig.scripts.json && node dist-scripts/verify-testnet.js"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^16.0.1",
     "buffer": "6.0.3"
   },
   "devDependencies": {
+    "@types/node": "18.19.100",
     "typescript": "^5.6.2"
   }
 }
